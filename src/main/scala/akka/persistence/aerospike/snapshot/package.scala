@@ -1,8 +1,11 @@
 package akka.persistence.aerospike
 
 package object snapshot {
+    def escapepid(persistenceId:String): String = {
+      persistenceId.replaceAll("_", "")
+    }
 	def gensnptkey(persistenceId:String, seqNr: Long, timestamp: Long) :String = {
-	  persistenceId.replaceAll("_", "")+"_"+seqNr+"_"+timestamp	  
+	  escapepid(persistenceId)+"_"+seqNr+"_"+timestamp	  
 	}
 
 	def keysnptpersistenceId(key: String) :String = {

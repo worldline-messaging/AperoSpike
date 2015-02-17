@@ -13,12 +13,23 @@ import akka.serialization.SerializationExtension
 import akka.persistence.PersistentConfirmation
 import scala.collection.generic.CanBuildFrom
 
+/**
+ * The aperospike configuration file for the journal
+ * 
+ */
 class AperoSpikeJournalConfig(config: Config) {
 	val urls = config.getStringList("urls")
 	val namespace = config.getString("namespace")
 	val set = config.getString("set")
+	val seqinterval = config.getLong("seqinterval")
 }
 
+/**
+ * The aperospike journal.
+ * This implementation is not complete and is based on the LRU of areospike to manage the deletion. 
+ * TODO: It is possible to improve the management of the deletion by including secondary indexes. 
+ * But the secondary indexes will certainly have an impact on performance. 
+ */
 class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	val serialization = SerializationExtension(context.system)
 	
@@ -27,6 +38,11 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	val client = AerospikeClient(config.urls)
     val messagesns = client.namespace(config.namespace).set[String,Array[Byte]](config.set)
 	
+	/**
+	 * Write a sequence of messages
+	 * @param messages
+	 * @return A future
+	 */
 	def asyncWriteMessages(messages: scala.collection.immutable.Seq[PersistentRepr]): Future[Unit] = {
 	  val puts = messages.map { m =>
 	    val key = genmsgkey(m.persistenceId,m.sequenceNr,"A")
@@ -36,6 +52,15 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	  Future.sequence(puts).map(_ => ())
 	}
 	
+	/**
+	 * Make a iterable of items be treated by futures, but serialize these treatments in the order of the collection.
+	 * It's like andThen { l(0) } andThen { l(1) } andThen { l(2) } .... andThen { l(n-1) }
+	 * http://www.michaelpollmeier.com/execute-scala-futures-in-serial-one-after-the-other-non-blocking/
+	 * @param l
+	 * @param fn
+	 * @param ec
+	 * @return
+	 */
 	def serialiseFutures[A, B](l: Iterable[A])(fn: A ⇒ Future[B])
     (implicit ec: ExecutionContext): Future[List[B]] =
       l.foldLeft(Future(List.empty[B])) {
@@ -46,16 +71,24 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
         } yield previousResults :+ next
       }
 	
+	/**
+	 * Write a confirmation
+	 * If the record does not exist, create it.
+	 * If the record exists, update it.
+	 * The channel id is saved in the payload.
+	 * @param confirmation
+	 * @return a future
+	 */
 	def asyncWriteConfirmation (confirmation: PersistentConfirmation): Future[Unit] = {
       val key = genmsgkey(confirmation.persistenceId,confirmation.sequenceNr,"C")
 	  messagesns.getBins(key, Seq("payload")).flatMap {
 	    r => {
 	      if(r.isEmpty) {
-	        println("Confirm is empty ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
+	        //println("Confirm is empty ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
             val bins : Map[String, Array[Byte]] = Map ("payload" -> confirmation.channelId.getBytes())
             messagesns.putBins(key, bins)
           } else {
-            println("Confirm:"+new String(r("payload"))+" ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
+            //println("Confirm:"+new String(r("payload"))+" ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
             val bins : Map[String, Array[Byte]] = Map ("payload" -> (new String(r("payload"))+":"+confirmation.channelId).getBytes())
             messagesns.putBins(key, bins)
           }
@@ -63,56 +96,44 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	  }
 	}
 	
+	/**
+	 * Write a sequence of confirmation
+	 * @param confirmations
+	 * @return a future
+	 */
 	def asyncWriteConfirmations(confirmations: scala.collection.immutable.Seq[PersistentConfirmation]): Future[Unit] = {
 	  serialiseFutures(confirmations)(asyncWriteConfirmation).map(_ => ())
-      /*val puts =  confirmations.map { c =>
-        val key = genmsgkey(c.persistenceId,c.sequenceNr,"C")
-        messagesns.getBins(key, Seq("payload")) map {
-          r => {
-            if(r.isEmpty) {
-              val bins : Map[String, Array[Byte]] = Map ("payload" -> c.channelId.getBytes())
-              messagesns.putBins(key, bins)
-            } else {
-              val bins : Map[String, Array[Byte]] = Map ("payload" -> (new String(r("payload"))+":"+c.channelId).getBytes())
-              messagesns.putBins(key, bins)
-            }
-          }
-        }
-      }
-	  Future.sequence(puts).map(_ => ())*/
     }
 	
+	/**
+	 * Not supported.
+	 * TODO: Try with the secondary index of aerospike ???
+	 * @param messageIds
+	 * @param permanent
+	 * @return a future
+	 */
 	def asyncDeleteMessages(messageIds: scala.collection.immutable.Seq[akka.persistence.PersistentId],permanent: Boolean): Future[Unit] = {
-	  if(permanent) {
-		val keys = messageIds.map(mid => Seq(genmsgkey(mid.persistenceId,mid.sequenceNr,"A"),genmsgkey(mid.persistenceId,mid.sequenceNr,"B"),genmsgkey(mid.persistenceId,mid.sequenceNr,"C"))).flatten
-		val deletes = keys.map(key => messagesns.delete(key))
-		Future.sequence(deletes).map(_ => ())
-	  } else {
-	    val keys = messageIds.map(mid => genmsgkey(mid.persistenceId,mid.sequenceNr,"B"))
-	    val puts = keys.map(key => messagesns.putBins(key, Map ("payload" -> Array(0x00))))
-	    Future.sequence(puts).map(_ => ())
-	  }
-	} 
-	  
-	def asyncDeleteMessagesTo(processorId: String, toSequenceNr: Long, permanent: Boolean): Future[Unit] = {
-	  val fromSequenceNr = readLowestSequenceNr(processorId, 1L)
-	  asyncDeleteMessagesFromTo(processorId,fromSequenceNr,toSequenceNr,permanent)
-    }
-	
-	def asyncDeleteMessagesFromTo(processorId: String, fromSequenceNr:Long, toSequenceNr: Long, permanent: Boolean): Future[Unit] = {
-	  if(permanent) {
-	    val keys = (fromSequenceNr to toSequenceNr).map(sequence => Seq(genmsgkey(processorId,sequence,"A"),genmsgkey(processorId,sequence,"B"),genmsgkey(processorId,sequence,"C"))).flatten
-	    val deletes = keys.map(key => messagesns.delete(key))
-		Future.sequence(deletes).map(_ => ())
-	  } else {
-	    val keys = (fromSequenceNr to toSequenceNr).map(sequence => genmsgkey(processorId,sequence,"B"))
-	    val puts = keys.map(key => messagesns.putBins(key, Map ("payload" -> Array(0x00))))
-	    Future.sequence(puts).map(_ => ())
-	  }  
+	  Future.failed(new UnsupportedOperationException("Individual deletions not supported"))
 	}
 	
+	/**
+	 * Save the deletions in memory. 
+	 * @see AperoSpikeRecovery
+	 * @param processorId
+	 * @param toSequenceNr
+	 * @param permanent
+	 * @return a future
+	 */
+	def asyncDeleteMessagesTo(processorId: String, toSequenceNr: Long, permanent: Boolean): Future[Unit] = {
+	  Future.successful(deletions = deletions + (processorId -> (toSequenceNr, permanent)))
+    }
+	
+	/**
+	 * deserialize a buffer
+	 * @param b
+	 * @return
+	 */
 	def persistentFromByteBuffer(b: Array[Byte]): PersistentRepr = {
       serialization.deserialize(b, classOf[PersistentRepr]).get
     }
-	
 }

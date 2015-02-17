@@ -16,8 +16,8 @@ libraryDependencies ++= Seq(
 "com.typesafe.akka" %% "akka-persistence-experimental" % "2.3.6" % "compile",
 "com.typesafe.akka" %% "akka-testkit" % "2.3.6" % "test",
 "com.typesafe.akka" %% "akka-persistence-tck-experimental" % "2.3.6" % "test",
-"com.datastax.cassandra"  % "cassandra-driver-core"  % "2.1.1",
-"com.tapad.scaerospike" %% "scaerospike" % "1.2.2-SNAPSHOT"	
+"com.tapad.scaerospike" %% "scaerospike" % "1.2.2-SNAPSHOT",
+"com.codahale.metrics" % "metrics-core" % "3.0.2"	
  )
 
 //"com.aerospike" % "aerospike-client" % "3.0.22" % "compile",

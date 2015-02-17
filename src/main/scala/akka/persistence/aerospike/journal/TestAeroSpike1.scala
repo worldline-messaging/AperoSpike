@@ -30,12 +30,12 @@ object TestAeroSpike1 extends App {
 	
     val client = AerospikeClient(Seq("localhost"))
     
-    val test1 = client.namespace("Akka").set[String, String]("Test1")
+    val test1 = client.namespace("Akka").set[String, Array[Byte]]("Test1")
 
     reporter.start(10, TimeUnit.SECONDS)
 	
-    for( i <- 0 to 999999){
-    	val write : Future[Unit] = test1.put("putkey"+i, String.format("%0"+1024+"d", int2Integer(i)))
+    for( i <- 0 to 9999999){
+    	val write : Future[Unit] = test1.put("putkey"+i, String.format("%0"+4096+"d", int2Integer(i)).getBytes())
     	write.onComplete {
     	  case Failure(ex)      => ex.printStackTrace()
     	  case Success(value)   => messagescounter.mark() 

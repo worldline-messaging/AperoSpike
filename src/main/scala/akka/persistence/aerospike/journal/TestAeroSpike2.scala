@@ -25,17 +25,19 @@ object TestAeroSpike2 extends App {
 
     reporter.start(10, TimeUnit.SECONDS)
 	
+    val wh = new WriteHandler()
+	
     for( i <- 0 to 999999){
         val key = new Key("Akka", "Test1", "putkey"+i)
-        val bin1 = new Bin("bin1", String.format("%0"+1024+"d", int2Integer(i)))
-        client.put(null, new WriteHandler(), key, bin1)        
+        val bin1 = new Bin("bin1", String.format("%0"+4096+"d", int2Integer(i)))
+        client.put(null, wh, key, bin1)        
     }
 	
 	reporter.report()
 	reporter.stop()
 	reporter.close()
 
-	private class WriteHandler extends WriteListener {
+	class WriteHandler extends WriteListener {
       override def onSuccess(key: Key) { 
         messagescounter.mark()
       }
