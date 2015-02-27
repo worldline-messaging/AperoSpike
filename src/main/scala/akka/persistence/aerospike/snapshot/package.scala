@@ -4,7 +4,8 @@ package object snapshot {
     def escapepid(persistenceId:String): String = {
       persistenceId.replaceAll("_", "")
     }
-	def gensnptkey(persistenceId:String, seqNr: Long, timestamp: Long) :String = {
+	
+    def gensnptkey(persistenceId:String, seqNr: Long, timestamp: Long) :String = {
 	  escapepid(persistenceId)+"_"+seqNr+"_"+timestamp	  
 	}
 
@@ -20,5 +21,13 @@ package object snapshot {
 	
 	def keysnpttimestamp(key: String):Long = {
 	  key.substring(key.lastIndexOf("_")+1).toLong
+	}
+	
+	def gensnptkeychild(baseKey:String, childIndex: Int) :String = {
+	  baseKey+"_"+childIndex	  
+	}
+	
+	def childsnapshot(key:String):Boolean = {
+	  key.count(_ == '_') > 2
 	}
 }

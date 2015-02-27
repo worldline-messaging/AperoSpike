@@ -21,19 +21,24 @@ case class GetCounter()
 case class CleanJournal(sequenceNr: Long)
 
 object MyPersistentActor {
-	def props(snapshotInterval: Int, snapshotSize: Int, maxMessages: Int, debug: Int): Props = Props(new MyPersistentActor(snapshotInterval,snapshotSize,maxMessages,debug))
+	def props(persistenceId: String, snapshotInterval: Int, snapshotSize: Int, maxMessages: Int, debug: Int): Props = Props(new MyPersistentActor(persistenceId,snapshotInterval,snapshotSize,maxMessages,debug))
 }
 
-class MyPersistentActor (snapshotInterval: Int, snapshotSize: Int, maxMessages: Int, debug: Int) extends PersistentActor {
+class MyPersistentActor (pid:String, snapshotInterval: Int, snapshotSize: Int, maxMessages: Int, debug: Int) extends PersistentActor {
 	
-	override def persistenceId = "my-persistent-actor"
+	override def persistenceId = pid
 	
 	var counter = 0
 	var seqNrSnap: Long = 0L
+	def journalSize = lastSequenceNr - seqNrSnap
+	
+	println("init snapshot")
+	val baseSnaphot = Array.fill[Byte](snapshotSize-10)('0')
+	println("end init snapshot")
 	
 	def receiveRecover: Receive = {
     	case cmd:BenchMsg => { updateStatus(cmd.data,true) }
-    	case SnapshotOffer(metadata, snapshot: String) => { counter = snapshot.toInt; seqNrSnap = metadata.sequenceNr }
+    	case SnapshotOffer(metadata, snapshot: Array[Byte]) => { println("snapshot offer size="+snapshot.length); counter = new String(snapshot).toInt; seqNrSnap = metadata.sequenceNr }
 	}
 	
 	def receiveCommand: Receive = {
@@ -47,22 +52,21 @@ class MyPersistentActor (snapshotInterval: Int, snapshotSize: Int, maxMessages: 
     	  sender() ! counter
     	}
     	case SaveSnapshotSuccess(metadata) => {
-    		deleteSnapshots(SnapshotSelectionCriteria.create(seqNrSnap - 1, Long.MaxValue))
-    		self ! CleanJournal(seqNrSnap)
+    		deleteSnapshots(SnapshotSelectionCriteria.create(seqNrSnap-1, Long.MaxValue))
+    		deleteMessages(seqNrSnap-1)
     	}
-    	case CleanJournal(seqNr) => deleteMessages(seqNr)
 	}
 	
 	def updateStatus (cmd:String, recover:Boolean): Unit = {
         if(!recover) {
           display(cmd,recover);
-          counter+=1; 
+          counter+=1
           //println(s"$maxMessages")
-	      if(counter%snapshotInterval==0) {
+	      if(journalSize >= snapshotInterval) {
 	        //if(counter < maxMessages) {
 		        println("SAVE SNAPSHOT")
 		        seqNrSnap = lastSequenceNr
-		        saveSnapshot(String.format("%0"+snapshotSize+"d", int2Integer(counter)))
+		        saveSnapshot(baseSnaphot++String.format("%0"+10+"d", int2Integer(counter)).getBytes())
 	        //}
 	      }
         } else
@@ -90,7 +94,8 @@ object PersistentBenchmark extends App {
     
 	implicit val timeout = Timeout(config.getInt("timeout") seconds)
 	
-	val processor = system.actorOf(MyPersistentActor.props(config.getInt("snapshotInterval"),config.getInt("snapshotSize"),config.getInt("numMessages"),config.getInt("debug")))
+	val processor = system.actorOf(MyPersistentActor.props(config.getString("persistenceId"),config.getInt("snapshotInterval"),
+	    config.getInt("snapshotSize"),config.getInt("numMessages"),config.getInt("debug")))
 	
 	val metrics = new MetricRegistry()
 	val messagescounter = metrics.meter("messages")
@@ -104,7 +109,7 @@ object PersistentBenchmark extends App {
 	
 	println("Actor="+processor)
 	val f = processor ? GetCounter()
-	var i = Await.result(f,Duration.Inf).asInstanceOf[Int]
+	var i = 0 //Await.result(f,Duration.Inf).asInstanceOf[Int]
 	
 	while(i <= config.getInt("numMessages")) {
 		val formatted = String.format("%0"+config.getInt("sizeMessage")+"d", int2Integer(i))

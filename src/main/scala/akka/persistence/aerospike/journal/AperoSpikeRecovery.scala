@@ -5,6 +5,7 @@ import akka.persistence.PersistentRepr
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
+import java.nio.ByteBuffer
 
 /**
  * @author a140168
@@ -14,9 +15,6 @@ import scala.concurrent.ExecutionContext.Implicits.global
 trait AperoSpikeRecovery { this: AperoSpikeJournal =>
   import config._
 
-  //This variable will be used to consolidate the state of the messages in the journal
-  var deletions: Map[String, (Long, Boolean)] = Map.empty
-  
   /**
    * Replay messages between an interval of sequence numbers
    * @param processorId
@@ -49,59 +47,31 @@ trait AperoSpikeRecovery { this: AperoSpikeJournal =>
     new MessageIterator(processorId, math.max(1L, fromSequenceNr), Long.MaxValue, Long.MaxValue, config.seqinterval).foldLeft(fromSequenceNr) { case (acc, msg) => msg.sequenceNr }
 
   /**
-   * Read the lowest sequence number for an actor
-   * The first message that is not deleted
-   * @param processorId
-   * @param fromSequenceNr
-   * @return
-   */
-  def readLowestSequenceNr(processorId: String, fromSequenceNr: Long): Long =
-    new MessageIterator(processorId, fromSequenceNr, Long.MaxValue, Long.MaxValue,config.seqinterval).find(!_.deleted).map(_.sequenceNr).getOrElse(fromSequenceNr)
-
-  /**
    * @param processorId
    * @param fromSequenceNr
    * @param toSequenceNr
    * @param max
    * @param replayCallback
    */
-  def replayMessages(processorId: String, fromSequenceNr: Long, toSequenceNr: Long, max: Long)(replayCallback: (PersistentRepr) => Unit): Unit =  {
-    //take the actual deletions
-    val deletions = this.deletions
-    //take the last deletion for this actor and the type of deletion (permanent/logical)
-    val (deletedTo, permanent) = deletions.getOrElse(processorId, (0L, false))
-    //if we're in permanent deletion, we start at last deleted + 1. Else we start at fromSequenceNr
-    val adjustedFrom = if (permanent) math.max(deletedTo + 1L, fromSequenceNr) else fromSequenceNr
-    //count the number of messages
-    val adjustedNum = toSequenceNr - adjustedFrom + 1L
-    //take in account the max parameter
-    val adjustedTo = if (max < adjustedNum) adjustedFrom + max - 1L else toSequenceNr
+  def replayMessages(processorId: String, fromSequenceNr: Long, toSequenceNr: Long, max: Long)(replayCallback: (PersistentRepr) => Unit): Unit =  
+    new MessageIterator(processorId, fromSequenceNr, toSequenceNr, max,config.seqinterval).foreach(replayCallback)
     
-    //recreate iterator updating delete status and replay messages that are in the interval
-    new MessageIterator(processorId, fromSequenceNr, toSequenceNr, max, config.seqinterval).map(p => 
-      if (!permanent && p.sequenceNr <= deletedTo) p.update(deleted = true) else p).foldLeft(adjustedFrom) {
-        case (snr, p) => if (p.sequenceNr >= adjustedFrom && p.sequenceNr <= adjustedTo) replayCallback(p); p.sequenceNr
-      }
-  }
-
   /**
    * Iterator over messages, crossing partition boundaries.
    */
   class MessageIterator(processorId: String, fromSequenceNr: Long, toSequenceNr: Long, max: Long, seqinterval:Long) extends scala.collection.Iterator[PersistentRepr] {
-    //println(debugprfx+" processorId="+processorId+" fromSequenceNr="+fromSequenceNr +" toSequenceNr="+toSequenceNr+ " max="+max)
+    println("processorId="+processorId+" fromSequenceNr="+fromSequenceNr +" toSequenceNr="+toSequenceNr+ " max="+max)
     import PersistentRepr.Undefined
 
     private val iter = new RecordIterator(processorId, fromSequenceNr, toSequenceNr,seqinterval)
     private var mcnt = 0L
 
     private var c: PersistentRepr = null
-    private var n: PersistentRepr = PersistentRepr(Undefined)
-
-    fetch()
+    
+    //fetch()
 
     def hasNext: Boolean = {
-      //println("\t"+debugprfx+" hasNext n="+n+" mcnt="+mcnt+" returns "+(n != null && mcnt < max))
-      n != null && mcnt < max
+      mcnt < max && iter.hasNext
     }
     
     def next(): PersistentRepr = {
@@ -111,30 +81,24 @@ trait AperoSpikeRecovery { this: AperoSpikeJournal =>
       c
     }
 
-    /**
-     * Make next message n the current message c, complete c
-     * (ignoring orphan markers) and pre-fetch new n.
-     */
     private def fetch(): Unit = {
-      c = n
-      n = null
-      //println("\t"+debugprfx+" fetch c="+c)
-      while (iter.hasNext && n == null) {
-        val row = iter.next()
-        val marker = keymsgmarker(row._1)
-        val snr = keymsgsequence(row._1)
-        //println("\tmarker="+marker+" snr="+snr+" row="+row)
-        if (marker == "A") {
-          val m = persistentFromByteBuffer(row._2("payload"))
-          n = m
-          //println("\t\t"+debugprfx+" m="+m+" c="+c+" n="+n)
-        } else if (marker == "B" && c.sequenceNr == snr) {
-          c = c.update(deleted = true)
-        } else if (c.sequenceNr == snr) {
-          val channelId = new String(row._2("payload"))
-          //println("channelId="+channelId)
-          c = c.update(confirms = channelId.split(":").toList)
-        }
+      
+      val row = iter.next()
+      val marker = keymsgmarker(row._1)
+      val snr = keymsgsequence(row._1)
+        
+      //println (row)
+      c = persistentFromByteBuffer(row._2("payload"))
+        
+      if (row._2.contains("confirm")) {
+	    val channelId = new String(row._2("confirm"))
+	    println("channelId="+channelId)
+	    c = c.update(confirms = channelId.split(":").toList)
+      }
+        
+      if(row._2.contains("deleted")) {
+        println("logically delete "+snr) 
+        c = c.update(deleted = true)
       }
     }
   }
@@ -146,8 +110,10 @@ trait AperoSpikeRecovery { this: AperoSpikeJournal =>
   class RecordIterator(processorId: String, fromSequenceNr: Long, toSequenceNr: Long, seqinterval:Long) extends scala.collection.Iterator[(String, Map[String, Array[Byte]])] {
     val nbseq = ((toSequenceNr-fromSequenceNr)/seqinterval)+1
     
-    var currentSnr = fromSequenceNr
-    val bins = Seq ("payload")
+    val lowest = Await.result(asyncReadLowestSequenceNr(processorId, 1L),Duration.Inf)
+    var currentSnr = if(lowest > fromSequenceNr) lowest else fromSequenceNr
+    
+    val bins = Seq ("payload","confirm","deleted")
     
     var toSnr = math.min(currentSnr+seqinterval-1, toSequenceNr)
     var currentrec = 0
@@ -156,9 +122,9 @@ trait AperoSpikeRecovery { this: AperoSpikeJournal =>
     
     private def keySeq(fromSequence: Long, toSequence: Long): Seq[String] = {
       (fromSequence to toSequence).map {
-        i => List(genmsgkey(processorId,i,"A"),
-            /* TODO B marker will be used when the deletion wont be based on the LRU of areospike: genmsgkey(processorId,i,"B") ,*/ 
-            genmsgkey(processorId,i,"C"))
+        i => List(genmsgkey(processorId,i,"A")
+            /*genmsgkey(processorId,i,"B") 
+            genmsgkey(processorId,i,"C")*/)
       }.flatten.toSeq
     }
     

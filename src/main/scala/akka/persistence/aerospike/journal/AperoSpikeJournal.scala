@@ -12,6 +12,10 @@ import scala.collection.JavaConversions._
 import akka.serialization.SerializationExtension
 import akka.persistence.PersistentConfirmation
 import scala.collection.generic.CanBuildFrom
+import java.nio.ByteBuffer
+import scala.concurrent.duration.Duration
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
 
 /**
  * The aperospike configuration file for the journal
@@ -21,23 +25,34 @@ class AperoSpikeJournalConfig(config: Config) {
 	val urls = config.getStringList("urls")
 	val namespace = config.getString("namespace")
 	val set = config.getString("set")
+	val ttl = config.getInt("ttl")
+	val ttlDeleteNP = config.getInt("ttlDeleteNP")
 	val seqinterval = config.getLong("seqinterval")
+	val selectorThreads = config.getInt("selectorThreads")
+	val touchOnDelete = config.getBoolean("touchOnDelete")
 }
 
 /**
  * The aperospike journal.
- * This implementation is not complete and is based on the LRU of areospike to manage the deletion. 
- * TODO: It is possible to improve the management of the deletion by including secondary indexes. 
- * But the secondary indexes will certainly have an impact on performance. 
+ * This implementation is not complete and is based on the LRU of areospike to manage the deletion.   
  */
 class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	val serialization = SerializationExtension(context.system)
 	
 	val config = new AperoSpikeJournalConfig(context.system.settings.config.getConfig("aperospike-journal"))
-	 
-	val client = AerospikeClient(config.urls)
-    val messagesns = client.namespace(config.namespace).set[String,Array[Byte]](config.set)
 	
+	val asyncTaskThreadPool = Executors.newCachedThreadPool(new ThreadFactory() {
+		override def newThread(runnable: Runnable) = {
+                        val thread = new Thread(runnable)
+                        thread.setDaemon(true)
+                        thread
+                }
+    })
+	
+	val client = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads, taskThreadPool=asyncTaskThreadPool))
+	
+    val messagesns = client.namespace(config.namespace).set[String,Array[Byte]](config.set)
+    
 	/**
 	 * Write a sequence of messages
 	 * @param messages
@@ -47,7 +62,7 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	  val puts = messages.map { m =>
 	    val key = genmsgkey(m.persistenceId,m.sequenceNr,"A")
 	    val bins : Map[String, Array[Byte]] = Map ("payload" -> serialization.serialize(m).get)
-	    messagesns.putBins(key, bins)
+	    messagesns.putBins(key, bins, Option(config.ttl))
 	  }
 	  Future.sequence(puts).map(_ => ())
 	}
@@ -80,16 +95,16 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	 * @return a future
 	 */
 	def asyncWriteConfirmation (confirmation: PersistentConfirmation): Future[Unit] = {
-      val key = genmsgkey(confirmation.persistenceId,confirmation.sequenceNr,"C")
-	  messagesns.getBins(key, Seq("payload")).flatMap {
+	  val key = genmsgkey(confirmation.persistenceId,confirmation.sequenceNr,"A")
+	  messagesns.getBins(key, Seq("confirm")).flatMap {
 	    r => {
-	      if(r.isEmpty) {
-	        //println("Confirm is empty ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
-            val bins : Map[String, Array[Byte]] = Map ("payload" -> confirmation.channelId.getBytes())
+	      if(!r.contains("confirm")) {
+	        println("Confirm is empty ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
+            val bins : Map[String, Array[Byte]] = Map ("confirm" -> confirmation.channelId.getBytes())
             messagesns.putBins(key, bins)
           } else {
-            //println("Confirm:"+new String(r("payload"))+" ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
-            val bins : Map[String, Array[Byte]] = Map ("payload" -> (new String(r("payload"))+":"+confirmation.channelId).getBytes())
+            println("Confirm:"+new String(r("confirm"))+" ("+confirmation.persistenceId+","+confirmation.sequenceNr+")")
+            val bins : Map[String, Array[Byte]] = Map ("confirm" -> (new String(r("confirm"))+":"+confirmation.channelId).getBytes())
             messagesns.putBins(key, bins)
           }
 	    }
@@ -106,8 +121,6 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
     }
 	
 	/**
-	 * Not supported.
-	 * TODO: Try with the secondary index of aerospike ???
 	 * @param messageIds
 	 * @param permanent
 	 * @return a future
@@ -125,8 +138,70 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	 * @return a future
 	 */
 	def asyncDeleteMessagesTo(processorId: String, toSequenceNr: Long, permanent: Boolean): Future[Unit] = {
-	  Future.successful(deletions = deletions + (processorId -> (toSequenceNr, permanent)))
+	  asyncReadLowestSequenceNr(processorId, 1L).flatMap { lowest =>
+		asyncDeleteMessagesFromTo(processorId,lowest,toSequenceNr,permanent)
+	  }
     }
+    
+    /**
+     * 
+     */
+	def asyncDeleteMessagesFromTo(processorId: String, fromSequenceNr:Long, toSequenceNr: Long, permanent: Boolean): Future[Unit] = {
+	  println("Delete from="+fromSequenceNr+" to="+toSequenceNr+" for "+processorId)
+	  if(permanent) {
+	    /*val keys = (fromSequenceNr to toSequenceNr).map(sequence => Seq(genmsgkey(processorId,sequence,"A"),
+	        genmsgkey(processorId,sequence,"B"), Do not need to delete the B marker
+	        genmsgkey(processorId,sequence,"C"))).flatten*/
+	    if(config.touchOnDelete) {
+	      val keys = (fromSequenceNr to toSequenceNr).map(sequence => genmsgkey(processorId,sequence,"A"))
+	      val deletes = keys.map(key => messagesns.touch(key,Option(1))) //Ttl at 1 second, so the evictor can do immediatly his job
+		  Future.sequence(deletes).map(_ => ()).andThen {
+	        case _ => asyncWriteLastDeletedSequenceNr(processorId,toSequenceNr)
+	      }
+	    } else {
+	      asyncWriteLastDeletedSequenceNr(processorId,toSequenceNr)
+	    }
+	  } else {
+	    println("logical delete for "+processorId+ " from="+fromSequenceNr+" to="+toSequenceNr)
+	    val keys = (fromSequenceNr to toSequenceNr).map(sequence => genmsgkey(processorId,sequence,"A"))
+	    val puts = keys.map(key => messagesns.putBins(key, 
+		    Map ("deleted" ->Array('L')), 
+		    Option(config.ttlDeleteNP)))
+	    Future.sequence(puts).map(_ => ())
+	  }
+	}
+	
+	/**
+     * Read the lowest sequence number for an actor
+     * The first message that is not deleted
+     * @param processorId
+     * @param fromSequenceNr
+     * @return
+     */
+    def asyncReadLowestSequenceNr(processorId: String, fromSequenceNr: Long): Future[Long] = {
+      val from = long2bytearray(fromSequenceNr)
+      messagesns.get(genmsgkey(processorId,0,"D"),"payload").map { r =>
+        val lowest = ByteBuffer.wrap(r.getOrElse(from)).getLong()
+        println("lowest seqnum="+lowest+" for "+processorId)
+        lowest
+      }
+    }
+    
+	/**
+	 * @param processorId
+	 * @param toSequenceNr
+	 */
+	def asyncWriteLastDeletedSequenceNr(processorId: String, toSequenceNr: Long): Future[Unit] = {
+	  val ba = long2bytearray(toSequenceNr+1)
+	  println("Last delete="+(toSequenceNr+1)+" for "+processorId)
+	  messagesns.putBins(genmsgkey(processorId,0,"D"), Map ("payload" -> ba), Option(config.ttl))
+	}
+	
+	private def long2bytearray(lng: Long): Array[Byte] = {
+	  val bb = ByteBuffer.allocate(8) //8, In java Long is 64bits
+	  bb.putLong(lng)
+	  bb.array()
+	}
 	
 	/**
 	 * deserialize a buffer

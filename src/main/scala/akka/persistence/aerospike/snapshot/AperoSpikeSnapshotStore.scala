@@ -18,6 +18,10 @@ import scala.concurrent.duration._
 import scala.concurrent.Await
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.Promise
+import com.tapad.aerospike.ClientSettings
+import com.tapad.aerospike.AsSetOps
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
 
 /**
  * @author a140168
@@ -40,6 +44,7 @@ trait AperoSpikeSnapshotStoreEndpoint extends Actor {
         case e => LoadSnapshotResult(None, toSequenceNr)
       } pipeTo (p)
     case SaveSnapshot(metadata, snapshot) =>
+      println ("Save the Snapshot")
       val p = sender
       val md = metadata.copy(timestamp = System.currentTimeMillis)
       saveAsync(md, snapshot) map {
@@ -74,6 +79,7 @@ class AeroSpikeSnapshotStoreConfig(config: Config) {
   val urls = config.getStringList("urls")
   val namespace = config.getString("namespace")
   val set = config.getString("set")
+  val selectorThreads = config.getInt("selectorThreads")
 }
 
 /**
@@ -91,24 +97,32 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
   import context.dispatcher
   import config._
 
-  val client = AerospikeClient(config.urls)
+  val asyncTaskThreadPool = Executors.newCachedThreadPool(new ThreadFactory() {
+		override def newThread(runnable: Runnable) = {
+                        val thread = new Thread(runnable)
+                        thread.setDaemon(true)
+                        thread
+                }
+    })
+    
+  val client = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads,taskThreadPool=asyncTaskThreadPool))
   val snapshotsns = client.namespace(config.namespace).set[String,Array[Byte]](config.set)
 
   var cache: Map[String, scala.collection.mutable.ListBuffer[String]] = Map.empty
   
   override def preStart() {
-    //println("initialize the cache")
+    println("initialize the cache")
     val bins = Seq () //DO NOT INCLUDE PAYLOAD!!!
     val filter = new ScanFilter [String, Map[String, Array[Byte]]] {
-   	  def filter(key: String, record:Map[String, Array[Byte]]): Boolean = { true }
+   	  def filter(key: String, record:Map[String, Array[Byte]]): Boolean = { childsnapshot(key)==false }
    	}
-    val records = Await.result(snapshotsns.scanAllRecords(bins,filter),Duration.Inf)
+    val records = Await.result(snapshotsns.scanAllRecords[List](bins,filter),Duration.Inf)
     records.foreach(r => {
       val l = cache.getOrElse(keysnptpersistenceId(r._1), scala.collection.mutable.ListBuffer.empty[String])
       l += r._1
       cache = cache + (keysnptpersistenceId(r._1) -> l)
     })
-    //println("cache="+cache)
+    println("cache="+cache)
   }
   
   /**
@@ -135,9 +149,36 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
    * load a snapshot
    */
   def load1Async(metadata: SnapshotMetadata): Future[Snapshot] = {
-    //println("load1Async metadata="+metadata+ " key="+gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp))
-    val record = snapshotsns.get(gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp), "payload")
-    record.map(r => deserialize(r.get))
+    println("load1Async metadata="+metadata+ " key="+gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp))
+    val baseKey = gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp)
+    
+    //get the keys for the potential children
+    val record = snapshotsns.getBins(baseKey, Seq("numchild"))
+    val fkeys = record map { r => 
+      val numchild = if(!r.keySet.exists(_=="numchild")) 1 else new String(r("numchild")).toInt
+      if(numchild > 1) {
+        baseKey +: (1 to numchild-1).map { i => baseKey+"_"+i }
+      } else { //no splitting
+        List(baseKey)
+      }
+    }
+    
+    //get the payloads for the keys
+    val payloads = fkeys.flatMap { keys =>
+      println("load snapshot keys="+keys)
+      val frecords = snapshotsns.multiGetBinsL(keys,Seq("payload"))
+      val res = frecords.map { records =>
+        records.map { r =>
+          r._2("payload")
+        }
+      }
+      res
+    }
+
+    //rebuild the payload and deserialize
+    payloads.map { pls =>
+      deserialize(pls.flatten.toArray)
+    }
   }
 
   /**
@@ -145,16 +186,65 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
    */
   def saveAsync(metadata: SnapshotMetadata, snapshot: Any): Future[Unit] = {
     val key = gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp)
-    //println("saveAsync key="+key+" snapshot="+snapshot)
-    val bins : Map[String, Array[Byte]] = Map ("payload" -> serialize(Snapshot(snapshot)))
-    snapshotsns.putBins(key, bins).andThen { case _ => Future {
+    val array = serialize(Snapshot(snapshot))
+    println("saveAsync key="+key+" size="+array.length)
+    splitAndSave(snapshotsns,key,"payload",array,900000).andThen { case _ => Future {
       val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
       l += key
       cache = cache + (keysnptpersistenceId(key) -> l)
       //println("cache update for "+keysnptpersistenceId(key)+"="+cache(keysnptpersistenceId(key)))
       }
     }
+    /*val bins : Map[String, Array[Byte]] = Map ("payload" -> array)
+    snapshotsns.putBins(key, bins).andThen { case _ => Future {
+      val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
+      l += key
+      cache = cache + (keysnptpersistenceId(key) -> l)
+      //println("cache update for "+keysnptpersistenceId(key)+"="+cache(keysnptpersistenceId(key)))
+      }
+    }*/
   }
+  
+  /**
+  * @param namespace
+  * @param baseKey
+  * @param binName
+  * @param payload
+  * @param maxSize
+  * @return
+  */
+  def splitAndSave(namespace: AsSetOps[String,Array[Byte]], baseKey: String, binName: String, payload: Array[Byte], maxSize: Int) : Future[Unit] = {
+    if(payload.length <= maxSize) { //No need to split
+      val bins : Map[String, Array[Byte]] = Map (binName -> payload)
+      namespace.putBins(baseKey, bins)
+    } else { //Need to split
+      val arrays = splitArray[Byte](payload,maxSize) //split the array
+      arrays.foreach{a => println( "split snapshot "+baseKey+" {"+a._1+","+a._2.length+"}") }
+      val puts = arrays.map { p => {
+        if(p._1==0) { //No suffix for the first array, but the numchild bin
+          val bins : Map[String, Array[Byte]] = Map (binName -> p._2,"numchild" -> new String(""+arrays.length).getBytes)
+          println("save snapshot baseKey="+baseKey)
+          namespace.putBins(baseKey, bins)
+        } else { //For the next array, we suffix the keys
+          val bins : Map[String, Array[Byte]] = Map (binName -> p._2)
+          val childkey = gensnptkeychild(baseKey,p._1)
+          println("save snapshot childKey="+childkey)
+          namespace.putBins(childkey, bins)
+        }
+      } }
+      Future.sequence(puts).map(_ => ())
+    }
+  }
+  
+  def splitArray[T](xs: Array[T], splitSize: Int): Seq[(Int,Array[T])] = {
+    var i = -1
+    (0 to xs.length-1 by splitSize).map { j =>
+      val rest = math.min(splitSize,xs.length-j)
+      println("j="+j+" rest="+rest)
+      ({i +=1;i},xs.slice(j, j+rest))
+    }
+  }
+  
   
   /**
    * delete a snapshot from aerospike and then delete from the metadata cache
@@ -162,8 +252,8 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
   def deleteAsync(metadata: Seq[SnapshotMetadata]): Future[Unit] = {
     val deletes = metadata.map( md => {
 	  val key = gensnptkey(md.persistenceId,md.sequenceNr,md.timestamp)
-	  //println("deleteAsync metadata="+Seq(md.persistenceId,md.sequenceNr,md.timestamp))
-	  snapshotsns.delete(key).andThen { case _ => Future {
+	  println("deleteAsync metadata="+Seq(md.persistenceId,md.sequenceNr,md.timestamp))
+	  deleteSingleAsync(key).andThen { case _ => Future {
 	    val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
 	    l -= key
 	    cache = cache + (keysnptpersistenceId(key) -> l)
@@ -174,6 +264,30 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
 	Future.sequence(deletes).map(_ => ())
   }
 
+  private def deleteSingleAsync (baseKey: String) : Future [Unit] = {
+    
+    //get the keys for the potential children
+    val record = snapshotsns.getBins(baseKey, Seq("numchild"))
+    val fkeys = record map { r => 
+      val numchild = if(!r.keySet.exists(_=="numchild")) 1 else new String(r("numchild")).toInt
+      if(numchild > 1) {
+        baseKey +: (1 to numchild-1).map { i => baseKey+"_"+i }
+      } else { //no splitting
+        List(baseKey)
+      }
+    }
+   
+    //delete
+    val fdeletes = fkeys.flatMap { keys =>
+      val deletes = keys.map { key =>
+        println( "delete snapshot "+key)
+        snapshotsns.delete(key)
+      }
+      Future.sequence(deletes).map(_ => ())
+    }
+    
+    fdeletes
+  }
   /**
    * delete snapshots corresponding to criteria
    */
