@@ -188,21 +188,12 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
     val key = gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp)
     val array = serialize(Snapshot(snapshot))
     println("saveAsync key="+key+" size="+array.length)
-    splitAndSave(snapshotsns,key,"payload",array,900000).andThen { case _ => Future {
+    splitAndSave(snapshotsns,key,"payload",array,900000).andThen { case _ => 
       val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
       l += key
       cache = cache + (keysnptpersistenceId(key) -> l)
       //println("cache update for "+keysnptpersistenceId(key)+"="+cache(keysnptpersistenceId(key)))
-      }
     }
-    /*val bins : Map[String, Array[Byte]] = Map ("payload" -> array)
-    snapshotsns.putBins(key, bins).andThen { case _ => Future {
-      val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
-      l += key
-      cache = cache + (keysnptpersistenceId(key) -> l)
-      //println("cache update for "+keysnptpersistenceId(key)+"="+cache(keysnptpersistenceId(key)))
-      }
-    }*/
   }
   
   /**
@@ -253,12 +244,11 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
     val deletes = metadata.map( md => {
 	  val key = gensnptkey(md.persistenceId,md.sequenceNr,md.timestamp)
 	  println("deleteAsync metadata="+Seq(md.persistenceId,md.sequenceNr,md.timestamp))
-	  deleteSingleAsync(key).andThen { case _ => Future {
+	  deleteSingleAsync(key).andThen { case _ =>
 	    val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
 	    l -= key
 	    cache = cache + (keysnptpersistenceId(key) -> l)
 	    //println("cache delete for "+keysnptpersistenceId(key)+"="+cache(keysnptpersistenceId(key)))
-	    }
 	  }
 	})
 	Future.sequence(deletes).map(_ => ())

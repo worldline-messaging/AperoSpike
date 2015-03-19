@@ -69,7 +69,7 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	
 	/**
 	 * Make a iterable of items be treated by futures, but serialize these treatments in the order of the collection.
-	 * It's like andThen { l(0) } andThen { l(1) } andThen { l(2) } .... andThen { l(n-1) }
+	 * It's like flatMap { l(0) } flatMap { l(1) } flatMap { l(2) } .... flatMap { l(n-1) }
 	 * http://www.michaelpollmeier.com/execute-scala-futures-in-serial-one-after-the-other-non-blocking/
 	 * @param l
 	 * @param fn
@@ -155,7 +155,7 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	    if(config.touchOnDelete) {
 	      val keys = (fromSequenceNr to toSequenceNr).map(sequence => genmsgkey(processorId,sequence,"A"))
 	      val deletes = keys.map(key => messagesns.touch(key,Option(1))) //Ttl at 1 second, so the evictor can do immediatly his job
-		  Future.sequence(deletes).map(_ => ()).andThen {
+		  Future.sequence(deletes).map(_ => ()).flatMap {
 	        case _ => asyncWriteLastDeletedSequenceNr(processorId,toSequenceNr)
 	      }
 	    } else {
@@ -194,7 +194,7 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
 	def asyncWriteLastDeletedSequenceNr(processorId: String, toSequenceNr: Long): Future[Unit] = {
 	  val ba = long2bytearray(toSequenceNr+1)
 	  println("Last delete="+(toSequenceNr+1)+" for "+processorId)
-	  messagesns.putBins(genmsgkey(processorId,0,"D"), Map ("payload" -> ba), Option(config.ttl))
+	  messagesns.putBins(genmsgkey(processorId,0,"D"), Map ("payload" -> ba), Option(-1)) //Should never be deleted
 	}
 	
 	private def long2bytearray(lng: Long): Array[Byte] = {
