@@ -13,8 +13,8 @@ import akka.persistence._
 import akka.util.Timeout
 
 import com.codahale.metrics.ConsoleReporter
-import com.codahale.metrics.Meter;
-import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Meter
+import com.codahale.metrics.MetricRegistry
 
 case class BenchMsg(data: String)
 case class GetCounter()
