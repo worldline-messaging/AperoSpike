@@ -94,6 +94,8 @@ object PersistentBenchmark extends App {
     
 	implicit val timeout = Timeout(config.getInt("timeout") seconds)
 	
+  val formatted = String.format("%0"+(config.getInt("sizeMessage")-10)+"d", int2Integer(0))
+  
 	val processor = system.actorOf(MyPersistentActor.props(config.getString("persistenceId"),config.getInt("snapshotInterval"),
 	    config.getInt("snapshotSize"),config.getInt("numMessages"),config.getInt("debug")))
 	
@@ -108,13 +110,13 @@ object PersistentBenchmark extends App {
 	reporter.start(10, TimeUnit.SECONDS)
 	
 	println("Actor="+processor)
-	val f = processor ? GetCounter()
+	//val f = processor ? GetCounter()
 	var i = 0 //Await.result(f,Duration.Inf).asInstanceOf[Int]
 	
 	while(i <= config.getInt("numMessages")) {
-		val formatted = String.format("%0"+config.getInt("sizeMessage")+"d", int2Integer(i))
+		val frame = formatted + String.format("%010d", int2Integer(i))
 		try {
-			val future = processor ? BenchMsg(formatted)
+			val future = processor ? BenchMsg(frame)
 			Await.result(future, Duration.Inf).asInstanceOf[String]
 			i = i + 1
 			messagescounter.mark

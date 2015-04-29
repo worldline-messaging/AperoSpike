@@ -1,3 +1,4 @@
+.cache
 application.conf*
 target
 .project

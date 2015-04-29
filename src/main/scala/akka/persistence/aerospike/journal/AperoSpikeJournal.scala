@@ -30,6 +30,7 @@ class AperoSpikeJournalConfig(config: Config) {
 	val seqinterval = config.getLong("seqinterval")
 	val selectorThreads = config.getInt("selectorThreads")
 	val touchOnDelete = config.getBoolean("touchOnDelete")
+  val commitAll = config.getBoolean("commitAll")
 }
 
 /**
@@ -50,8 +51,9 @@ class AperoSpikeJournal extends AsyncWriteJournal with AperoSpikeRecovery {
     })
 	
 	val client = AerospikeClient(config.urls,new ClientSettings(blockingMode=true,selectorThreads=config.selectorThreads, taskThreadPool=asyncTaskThreadPool))
-	
-    val messagesns = client.namespace(config.namespace).set[String,Array[Byte]](config.set)
+	val wp = WriteSettings(commitAll=config.commitAll)
+  
+    val messagesns = client.namespace(config.namespace,writeSettings=wp).set[String,Array[Byte]](config.set)
     
 	/**
 	 * Write a sequence of messages

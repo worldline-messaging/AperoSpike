@@ -80,6 +80,7 @@ class AeroSpikeSnapshotStoreConfig(config: Config) {
   val namespace = config.getString("namespace")
   val set = config.getString("set")
   val selectorThreads = config.getInt("selectorThreads")
+  val splitSize = config.getInt("splitSize")
 }
 
 /**
@@ -188,7 +189,7 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
     val key = gensnptkey(metadata.persistenceId,metadata.sequenceNr,metadata.timestamp)
     val array = serialize(Snapshot(snapshot))
     println("saveAsync key="+key+" size="+array.length)
-    splitAndSave(snapshotsns,key,"payload",array,900000).andThen { case _ => 
+    splitAndSave(snapshotsns,key,"payload",array,config.splitSize).andThen { case _ => 
       val l = cache.getOrElse(keysnptpersistenceId(key), scala.collection.mutable.ListBuffer.empty[String])
       l += key
       cache = cache + (keysnptpersistenceId(key) -> l)
@@ -214,12 +215,12 @@ class AperoSpikeSnapshotStore extends AperoSpikeSnapshotStoreEndpoint with Actor
       val puts = arrays.map { p => {
         if(p._1==0) { //No suffix for the first array, but the numchild bin
           val bins : Map[String, Array[Byte]] = Map (binName -> p._2,"numchild" -> new String(""+arrays.length).getBytes)
-          println("save snapshot baseKey="+baseKey)
+          //println("save snapshot baseKey="+baseKey)
           namespace.putBins(baseKey, bins)
         } else { //For the next array, we suffix the keys
           val bins : Map[String, Array[Byte]] = Map (binName -> p._2)
           val childkey = gensnptkeychild(baseKey,p._1)
-          println("save snapshot childKey="+childkey)
+          //println("save snapshot childKey="+childkey)
           namespace.putBins(childkey, bins)
         }
       } }
